@@ -57,10 +57,34 @@
 #define UAC1_REQ_SET_CUR      0x01
 #define UAC1_REQ_GET_CUR      0x81
 
-/* Target number of stereo frames buffered in the I2S ring. 256 frames keeps
- * latency low (~5.3 ms @ 48 kHz) while leaving ample margin against
- * under/overflow (ring holds 2048 frames). */
-#define TARGET_FILL_FRAMES    256
+/* Adaptive target fill (latency auto-tuning).
+ *
+ * The servo parks the I2S ring at a target fill; that fill IS the recorder's
+ * buffering latency.  Instead of a fixed 256 frames, the target is kept in
+ * milliseconds and tuned while streaming, like an adaptive jitter buffer:
+ *
+ *   - start small (ADAPT_START_MS);
+ *   - after each packet, look at the headroom left in the ring.  A packet that
+ *     could not be filled (underrun) or left less than ADAPT_NEAR_MS behind
+ *     raises the target at once (fast up);
+ *   - after ADAPT_CALM_PACKETS packets (1 per ms) whose minimum headroom
+ *     stayed comfortably above the margin, lower it by one small step
+ *     (slow down).
+ *
+ * After a raise, near-underrun events are ignored for ADAPT_COOLDOWN_PACKETS
+ * while the servo pulls the fill up (it moves at most SERVO_MAX_CORR frames
+ * per ms, so target changes never cause a click, only a slight time-warp).
+ * The learned target persists across streams until power-off.  Only events
+ * while locked and primed count: clock loss and slips re-prime instead. */
+#define ADAPT_START_MS          3.0f
+#define ADAPT_MIN_MS            1.5f
+#define ADAPT_MAX_MS            12.0f
+#define ADAPT_STEP_UP_MS        1.0f     /* per near-underrun */
+#define ADAPT_UNDERRUN_UP_MS    2.0f     /* per real underrun */
+#define ADAPT_STEP_DOWN_MS      0.25f
+#define ADAPT_NEAR_MS           0.25f    /* headroom below this = near underrun */
+#define ADAPT_CALM_PACKETS      30000u   /* ~30 s without trouble before a step down */
+#define ADAPT_COOLDOWN_PACKETS  500u     /* ~0.5 s for the servo to follow a raise */
 
 /* Proportional servo gain and clamp. The I2S and USB clocks differ only by a
  * few ppm, so only a tiny correction is ever needed in steady state; the clamp
@@ -81,6 +105,16 @@ static float                g_acc          = 0.0f;    /* fractional-sample accum
 static bool g_streaming = false;   /* AS alt setting 1 active */
 static bool g_primed    = false;   /* FIFO has reached target at least once */
 
+/* Adaptive target state (see ADAPT_*). */
+static float    g_target_ms       = ADAPT_START_MS;
+static uint32_t g_target_frames   = 144;      /* g_target_ms at the current rate */
+static uint32_t g_calm_packets    = 0;
+static uint32_t g_cooldown        = 0;
+static float    g_min_headroom    = 1e9f;     /* frames, over the current calm window */
+static uint32_t g_underruns       = 0;        /* diagnostics */
+static uint32_t g_near_underruns  = 0;
+static volatile bool g_target_changed = false;   /* log request for the main loop */
+
 /* IN packet scratch (RAM). Only touched while no transfer is in flight. */
 static uint8_t __attribute__((aligned(4))) g_pkt[USBRX_EP_IN_SIZE];
 
@@ -96,6 +130,50 @@ static void update_nominal_from_i2s(void)
         actual = (float) g_usb_sample_rate;   /* fallback before a measurement exists */
     }
     g_nominal_fpf = actual / 1000.0f;
+}
+
+static void adapt_set_target(float ms)
+{
+    if (ms < ADAPT_MIN_MS) ms = ADAPT_MIN_MS;
+    if (ms > ADAPT_MAX_MS) ms = ADAPT_MAX_MS;
+    if (ms != g_target_ms) {
+        g_target_ms      = ms;
+        g_target_changed = true;   /* printed from the main loop, not here */
+    }
+    g_calm_packets = 0;
+    g_min_headroom = 1e9f;
+}
+
+static void adapt_raise(float step_ms)
+{
+    adapt_set_target(g_target_ms + step_ms);
+    g_cooldown = ADAPT_COOLDOWN_PACKETS;
+}
+
+/* Called once per streamed packet with the ring headroom left after it. */
+static void adapt_after_packet(float headroom_frames)
+{
+    if (g_cooldown) {
+        g_cooldown--;
+        return;
+    }
+    if (headroom_frames < ADAPT_NEAR_MS * g_nominal_fpf) {
+        g_near_underruns++;
+        adapt_raise(ADAPT_STEP_UP_MS);
+        return;
+    }
+    if (headroom_frames < g_min_headroom) g_min_headroom = headroom_frames;
+    if (++g_calm_packets >= ADAPT_CALM_PACKETS) {
+        /* Step down only if the whole window kept enough spare headroom that
+         * the smaller target would still clear the near-underrun margin. */
+        float spare_ms = g_min_headroom / g_nominal_fpf;
+        if (spare_ms > ADAPT_STEP_DOWN_MS + ADAPT_NEAR_MS) {
+            adapt_set_target(g_target_ms - ADAPT_STEP_DOWN_MS);
+        } else {
+            g_calm_packets = 0;
+            g_min_headroom = 1e9f;
+        }
+    }
 }
 
 static inline uint16_t silence_bytes(void)
@@ -127,17 +205,18 @@ static uint16_t fill_audio_packet(uint8_t *buf)
         g_acc = 0.0f;
     }
     update_nominal_from_i2s();
+    g_target_frames = (uint32_t)(g_target_ms * g_nominal_fpf + 0.5f);
 
     uint32_t avail = i2s_rx_frames_available();   /* stereo frames available */
 
     /* Prime: wait until the FIFO has filled to the target before streaming audio. */
     if (!g_primed) {
-        if (avail >= (uint32_t) TARGET_FILL_FRAMES) {
+        if (avail >= g_target_frames) {
             /* Start exactly at the target fill: audio that piled up while
              * acquiring would otherwise take the clamped servo a long, pitch-
              * shifted time to drain. */
-            i2s_rx_trim(TARGET_FILL_FRAMES);
-            avail    = TARGET_FILL_FRAMES;
+            i2s_rx_trim(g_target_frames);
+            avail    = g_target_frames;
             g_primed = true;
             g_acc    = 0.0f;
         } else {
@@ -148,7 +227,7 @@ static uint16_t fill_audio_packet(uint8_t *buf)
     }
 
     /* ---- Rate-matching servo: nominal feed-forward + clamped P correction ---- */
-    int   err  = (int) avail - TARGET_FILL_FRAMES;
+    int   err  = (int) avail - (int) g_target_frames;
     float corr = SERVO_KP * (float) err;
     if (corr >  SERVO_MAX_CORR) corr =  SERVO_MAX_CORR;
     if (corr < -SERVO_MAX_CORR) corr = -SERVO_MAX_CORR;
@@ -159,15 +238,19 @@ static uint16_t fill_audio_packet(uint8_t *buf)
 
     if (n < 0) n = 0;
     if (n > USBRX_MAX_FRAMES_PER_PACKET) n = USBRX_MAX_FRAMES_PER_PACKET;
-    if ((uint32_t) n > avail) n = (int) avail;
+    if ((uint32_t) n > avail) n = (int) avail;   /* starved: headroom 0 below */
 
     if (n == 0) {
-        /* Real underrun: keep the stream alive and re-prime. */
+        /* Real underrun: keep the stream alive, re-prime, and buffer more. */
+        g_underruns++;
+        adapt_raise(ADAPT_UNDERRUN_UP_MS);
         g_primed = false;
         uint16_t z = silence_bytes();
         memset(buf, 0, z);
         return z;
     }
+
+    adapt_after_packet((float)(avail - (uint32_t) n));
 
     /* ---- Copy + convert n stereo frames to 24-bit LE ---- */
     uint32_t got = i2s_rx_read_s24le(buf, (uint32_t) n);
@@ -533,6 +616,13 @@ int main(void)
                 printf("I2S clocks lost\n");
             }
             last_state = st;
+        }
+
+        if (g_target_changed) {
+            g_target_changed = false;
+            printf("latency target %.2f ms (underruns %lu, near %lu)\n",
+                   (double) g_target_ms, (unsigned long) g_underruns,
+                   (unsigned long) g_near_underruns);
         }
     }
     return 0;

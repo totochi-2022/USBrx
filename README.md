@@ -18,10 +18,35 @@
 - Framing slips (the master restarted or glitched, e.g. DSPi resyncing its
   outputs) are flagged by the PIO program and the receiver restarts cleanly.
   Clock loss (no LRCLK for 5 ms) streams silence until the clocks return.
-- The servo is unchanged except that it starts exactly at the target fill.
+- The servo starts exactly at the target fill, and the target is **adaptive**
+  (see below) instead of a fixed 256 frames.
 - USB: product string "USBrx I2S", input terminal type *line connector*
   (0x0603), bcdDevice 0x0200.
 - Builds for Pico (RP2040) and Pico 2 (RP2350): `-DPICO_BOARD=pico2`.
+
+### I2S variant: latency auto-tuning
+
+The ring set-point is the recorder's buffering latency. It is tuned while
+streaming, like an adaptive jitter buffer (`ADAPT_*` in `src/main.c`):
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `ADAPT_START_MS` | 3.0 | Initial target (5.3 ms fixed before) |
+| `ADAPT_MIN_MS` / `ADAPT_MAX_MS` | 1.5 / 12.0 | Bounds |
+| `ADAPT_NEAR_MS` | 0.25 | Headroom left after a packet below this = near underrun |
+| `ADAPT_STEP_UP_MS` / `ADAPT_UNDERRUN_UP_MS` | 1.0 / 2.0 | Raise at once on a near underrun / real underrun |
+| `ADAPT_CALM_PACKETS` | 30000 | ~30 s of comfortable headroom before stepping down |
+| `ADAPT_STEP_DOWN_MS` | 0.25 | Step down size |
+| `ADAPT_COOLDOWN_PACKETS` | 500 | Ignore near events while the servo follows a raise |
+
+- Fast up, slow down. A step down happens only if the whole calm window kept
+  enough headroom that the smaller target still clears the margin.
+- Changes never click: the servo moves the fill by at most 2 frames per ms
+  (a tiny, inaudible time-warp).
+- Only events while locked and streaming count. Clock loss and slips re-prime
+  instead of raising the target. The learned target is kept across streams
+  until power-off.
+- Each change is logged on the UART: `latency target X ms (underruns N, near M)`.
 
 ### I2S variant: wiring
 
@@ -134,7 +159,8 @@ count per frame (so 44.1/88.2 kHz average out correctly). The feed-forward term
 uses the *measured* S/PDIF frequency, so the proportional correction only ever
 has to absorb tiny clock jitter — the loop is gentle and never audibly
 time-warps the audio. The buffer parks at `TARGET_FILL_FRAMES` (256 ≈ 5.3 ms
-@ 48 kHz), comfortably clear of underflow and overflow.
+@ 48 kHz), comfortably clear of underflow and overflow. *(I2S variant: the
+set-point is adaptive instead; see "Latency auto-tuning" at the top.)*
 
 ### Why a custom UAC1 class driver?
 
@@ -304,8 +330,8 @@ All in `src/main.c`:
 
 | Define               | Default | Effect |
 |----------------------|---------|--------|
-| `SPDIF_DATA_PIN`     | 15      | S/PDIF input GPIO |
-| `TARGET_FILL_FRAMES` | 256     | Buffer set-point → capture latency (≈ 5.3 ms @ 48 kHz). Lower = less latency, less jitter margin. |
+| `SPDIF_DATA_PIN`     | 15      | S/PDIF input GPIO *(I2S variant: `I2S_*_PIN`)* |
+| `TARGET_FILL_FRAMES` | 256     | Buffer set-point → capture latency (≈ 5.3 ms @ 48 kHz). Lower = less latency, less jitter margin. *(I2S variant: replaced by the adaptive `ADAPT_*` settings.)* |
 | `SERVO_KP`           | 0.008   | Servo proportional gain. |
 | `SERVO_MAX_CORR`     | 2.0     | Max packet-size deviation (samples/frame). |
 
