@@ -7,7 +7,7 @@ if(EXISTS ${CMAKE_CURRENT_LIST_DIR}/pico-sdk/pico_sdk_init.cmake)
     set(PICO_SDK_PATH ${CMAKE_CURRENT_LIST_DIR}/pico-sdk)
 endif()
 
-# Target the Raspberry Pi Pico (RP2040) by default.
+# Target the Raspberry Pi Pico (RP2040) by default; -DPICO_BOARD=pico2 for RP2350.
 set(PICO_BOARD pico CACHE STRING "Board type")
 
 include(pico_sdk_import.cmake)
@@ -19,19 +19,14 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 pico_sdk_init()
 
-# pico_spdif_rx's CMake links an unused 'pico_audio_32b' (only needed by its I2S
-# sample, not by the receiver itself). Provide an empty stub so we can reuse the
-# library's CMake without pulling in pico-extras.
-if (NOT TARGET pico_audio_32b)
-    add_library(pico_audio_32b INTERFACE)
-endif()
-
-add_subdirectory(lib/pico_spdif_rx pico_spdif_rx)
-
 add_executable(usbrx
     src/main.c
     src/usb_descriptors.c
+    src/i2s_rx.c
 )
+
+# I2S slave receiver PIO program (from DSPi's i2s_input.pio).
+pico_generate_pio_header(usbrx ${CMAKE_CURRENT_LIST_DIR}/src/i2s_rx.pio)
 
 # Make tusb_config.h (in src/) visible to the TinyUSB sources, which are compiled
 # in this executable's context by the SDK.
@@ -41,14 +36,9 @@ target_include_directories(usbrx PRIVATE
 
 target_link_libraries(usbrx
     pico_stdlib
-    pico_spdif_rx
+    hardware_pio
+    hardware_dma
     tinyusb_device
-)
-
-# Assign PIO0 / DMA_IRQ0 to the S/PDIF receiver (its defaults; stated explicitly).
-target_compile_definitions(usbrx PRIVATE
-    PICO_SPDIF_RX_PIO=0
-    PICO_SPDIF_RX_DMA_IRQ=0
 )
 
 # Debug log over UART0 (GP0/GP1); keep USB free for audio.

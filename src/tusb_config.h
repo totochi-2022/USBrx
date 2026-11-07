@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
- * TinyUSB device configuration for the SPDIF -> USB UAC1 recording device.
+ * TinyUSB device configuration for the I2S (ADC) -> USB UAC1 recording device.
  * Copyright (C) 2026 Weeb Labs
  *
  * IMPORTANT: TinyUSB's built-in audio class driver (audio_device.c) is UAC2-only

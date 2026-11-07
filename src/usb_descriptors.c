@@ -1,17 +1,17 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
- * USB descriptors for the SPDIF -> USB UAC1 stereo recording device.
+ * USB descriptors for the I2S (ADC) -> USB UAC1 stereo recording device.
  * Copyright (C) 2026 Weeb Labs
  *
  * Topology (Audio Class 1.0):
  *
- *   [Input Terminal: S/PDIF interface, ID 1] --> [Output Terminal: USB streaming, ID 2]
+ *   [Input Terminal: line connector (I2S ADC), ID 1] --> [Output Terminal: USB streaming, ID 2]
  *                                                          |
  *                                              AudioStreaming IN endpoint (0x81)
  *
  * Format: Type I PCM, 2 channels, 24-bit, discrete rates 44.1/48/88.2/96 kHz.
  * The IN endpoint is isochronous / asynchronous: the device is the clock master
- * (driven by the incoming S/PDIF stream) and the host adapts to the data rate.
+ * (driven by the I2S master's clock) and the host adapts to the data rate.
  */
 
 #include "tusb.h"
@@ -30,7 +30,7 @@
 #define EPNUM_AUDIO_IN           0x81
 
 /* Audio entity IDs */
-#define UAC1_INPUT_TERMINAL_ID   0x01   /* S/PDIF interface */
+#define UAC1_INPUT_TERMINAL_ID   0x01   /* line input (I2S ADC) */
 #define UAC1_OUTPUT_TERMINAL_ID  0x02   /* USB streaming     */
 
 /* USB IDs (test/development values) */
@@ -56,7 +56,7 @@ tusb_desc_device_t const desc_device =
 
     .idVendor           = USB_VID,
     .idProduct          = USB_PID,
-    .bcdDevice          = 0x0100,
+    .bcdDevice          = 0x0200,   /* I2S variant: own descriptor cache entry */
 
     .iManufacturer      = 0x01,
     .iProduct           = 0x02,
@@ -108,10 +108,10 @@ uint8_t const desc_configuration[] =
     0x01,                          /* bInCollection: 1 streaming interface */
     ITF_NUM_AUDIO_STREAMING,       /* baInterfaceNr(1) */
 
-    /* Input terminal: S/PDIF interface, stereo */
+    /* Input terminal: line connector (I2S ADC), stereo */
     12, TUSB_DESC_CS_INTERFACE, AUDIO_CS_AC_INTERFACE_INPUT_TERMINAL,
     UAC1_INPUT_TERMINAL_ID,        /* bTerminalID */
-    U16LE(0x0605),                 /* wTerminalType = S/PDIF interface */
+    U16LE(0x0603),                 /* wTerminalType = line connector */
     0x00,                          /* bAssocTerminal */
     USBRX_N_CHANNELS,              /* bNrChannels = 2 */
     U16LE(0x0003),                 /* wChannelConfig = Left + Right */
@@ -194,7 +194,7 @@ char const *string_desc_arr[] =
 {
     (const char[]){ 0x09, 0x04 },   /* 0: English (0x0409) */
     "Weeb Labs",                    /* 1: Manufacturer */
-    "Weeb Labs USBrx",              /* 2: Product */
+    "USBrx I2S",                    /* 2: Product */
     "0001",                         /* 3: Serial */
 };
 

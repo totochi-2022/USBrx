@@ -1,5 +1,66 @@
 # Weeb Labs USBrx — S/PDIF → USB audio capture (RP2040)
 
+> **This branch (`i2s-input`, fork totochi-2022/USBrx): I2S ADC input instead of S/PDIF.**
+> It turns a second Pico into the recording half of a full-duplex setup with
+> [DSPi](https://github.com/WeebLabs/DSPi): DSPi plays, this recorder captures an
+> I2S ADC, and **both run on DSPi's I2S clocks** (24-bit, 44.1/48/88.2/96 kHz).
+> The rest of this README describes the original S/PDIF firmware; the
+> differences are listed in this section.
+
+### I2S variant: what changed
+
+- The S/PDIF receiver (`pico_spdif_rx`, submodule removed) is replaced by
+  `src/i2s_rx.c` + `src/i2s_rx.pio`: DSPi's framing-checked I2S **slave** RX
+  program (`audio_i2s_rx_slave_checked`) feeding an IRQ-less DMA ring
+  (2048 stereo frames).
+- The sample rate is measured from LRCLK (DMA ring advance over 32 ms windows)
+  and snapped to 44.1 / 48 / 88.2 / 96 kHz; lock needs two agreeing windows.
+- Framing slips (the master restarted or glitched, e.g. DSPi resyncing its
+  outputs) are flagged by the PIO program and the receiver restarts cleanly.
+  Clock loss (no LRCLK for 5 ms) streams silence until the clocks return.
+- The servo is unchanged except that it starts exactly at the target fill.
+- USB: product string "USBrx I2S", input terminal type *line connector*
+  (0x0603), bcdDevice 0x0200.
+- Builds for Pico (RP2040) and Pico 2 (RP2350): `-DPICO_BOARD=pico2`.
+
+### I2S variant: wiring
+
+| Signal | Recorder Pico | Connects to |
+|---|---|---|
+| BCK   | GP10 (input) | DSPi BCK (default GPIO 14) and the ADC BCK |
+| LRCLK | GP11 (input) | DSPi LRCLK (default GPIO 15) and the ADC LRCK |
+| DATA  | GP12 (input) | ADC DOUT |
+| GND   | GND | DSPi GND and ADC GND |
+| (MCK) | — | DSPi MCK (default GPIO 13) → ADC SCKI, if the ADC needs it |
+| Rate LEDs | GP2..GP5 | high when locked at 44.1 / 48 / 88.2 / 96 kHz |
+| Debug | GP0/GP1 | UART0 115200 |
+
+- DSPi must be **driving BCK/LRCLK**: at least one DSPi output slot set to I2S
+  (and MCK enabled if the ADC needs a system clock).
+- The ADC must be in **slave mode, I2S (Philips) format, 24-bit**
+  (e.g. PCM1808: MD0 = MD1 = low, FMT = low, SCKI = DSPi MCK at 256 fs).
+- Pins are the `I2S_*_PIN` defines at the top of `src/main.c`.
+- The host sees DSPi (playback) and USBrx I2S (recording) as two devices; use
+  PipeWire, a macOS aggregate device, or ASIO4ALL to treat them as one. Both
+  run on DSPi's crystal, so no drift accumulates between them.
+- Select the same rate on the host as DSPi is running at (the recorder
+  follows LRCLK and does not resample).
+
+### I2S variant: build
+
+```sh
+git clone -b i2s-input https://github.com/totochi-2022/USBrx.git
+cd USBrx
+mkdir build && cd build
+cmake -DCMAKE_BUILD_TYPE=Release ..                 # Pico (RP2040)
+# cmake -DCMAKE_BUILD_TYPE=Release -DPICO_BOARD=pico2 ..   # Pico 2 (RP2350)
+cmake --build . -j4                                  # -> build/usbrx.uf2
+```
+
+Status (2026-11-07): written, **not yet built or tested on hardware**.
+
+---
+
 Firmware for the Raspberry Pi Pico / RP2040 that receives a stereo **S/PDIF**
 stream on a GPIO and presents it to a USB host as a **class-compliant USB Audio
 Class 1.0 recording device** ("Weeb Labs USBrx"). No drivers required on

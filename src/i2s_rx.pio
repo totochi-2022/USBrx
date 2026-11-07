@@ -1,0 +1,125 @@
+;
+; Copyright (c) 2026 WeebLabs
+;
+; SPDX-License-Identifier: BSD-3-Clause
+;
+; Taken verbatim from WeebLabs/DSPi firmware/DSPi/i2s_input.pio (the
+; external-clock slave variant only).  USBrx (I2S build) is always an I2S
+; SLAVE: BCK/LRCLK come from DSPi (or another master); this program samples
+; the ADC's data line against them and verifies framing every frame.
+;
+; Each pushed word is one channel sample: audio in bits [31:8].  Word order in
+; the FIFO is Left, Right, Left, Right, ...; the first word pushed after a
+; (re)start is always a LEFT word and slips keep strict L,R alternation.
+
+; ----------------------------------------------------------------------------
+; audio_i2s_rx_slave_checked - external-clock variant with per-frame LRCLK
+; framing verification.
+;
+; Used when i2s_clock_mode == I2S_CLOCK_MODE_SLAVE: an EXTERNAL master
+; drives BCK/LRCLK.  Real-world masters (USB-I2S bridges like the Amanero
+; Combo384) glitch or re-frame their clocks around stream stop/start and
+; rate-family switches.  With the free-running program above, one runt BCK
+; pulse or LRCLK phase jump shifts the 32-bit autopush window for the rest
+; of the session - the sign bit lands mid-word and the word RATE is
+; unchanged, so the software rate watchdog can never see it.
+;
+; This variant re-derives framing from LRCLK every frame.  The frame loop
+; samples the 64 bits by count (deterministic 24-in-32 alignment, autopush
+; at 32), then verifies LRCLK level at the two cells straddling the frame
+; boundary:
+;
+;   bit 63 (cell R31): LRCLK must still be HIGH (it rises at cell L32)
+;   bit 64 (cell R32): LRCLK must be LOW (it falls at cell R32's start)
+;
+; Checking two ADJACENT cells across an LRCLK edge catches every sub-frame
+; misalignment: a fixed slip of k cells passes both checks only if the
+; first checked cell is still the last HIGH cell, i.e. k == 0 (mod 64).
+; A single level check (or any pair 32 cells apart) would miss ~half of
+; all offsets forever.  Slips of exactly +/-1 whole frame are inherently
+; undetectable from LRCLK (the stream is validly framed, just shifted in
+; time) - documented as a known limit in the slave-mode spec.
+;
+; Both checks run half a BCK period after the nearest possible LRCLK
+; transition (just after a BCK rising edge), so the pad synchronizers have
+; long settled.  On a mismatch the program raises PIO irq flag 7 (read and
+; cleared by i2s_slave_poll, which treats it like a clock loss: mute,
+; restart, re-lock) and re-frames itself at the next LRCLK falling edge,
+; so at most ~2 frames of garbage reach the ring even before software
+; reacts.  The resync path from the bit-63 check first completes the
+; partial right word with one null bit: pushes stay in strict L,R
+; alternation, so the ring's even-index-is-LEFT invariant survives every
+; slip (channels can never swap).
+;
+; Same placeholder convention as above: wait gpio 0 = BCK, gpio 1 = LRCLK,
+; patched at load.  The JMP pin (EXECCTRL) must be configured to LRCLK.
+
+.program audio_i2s_rx_slave_checked
+
+public entry_point:
+    wait 1 gpio 1               ; [patched: LRCLK] ensure right-channel phase
+    wait 0 gpio 1               ; [patched: LRCLK] falling edge
+    wait 0 gpio 0               ; [patched: BCK] skew guard
+    wait 1 gpio 0               ; [patched: BCK] rising edge clocks last R bit
+.wrap_target
+    set x, 30                   ; 31 bit-pairs = bits 1..62 (cells L1..R30)
+bitpair:
+    wait 0 gpio 0               ; [patched: BCK]
+    wait 1 gpio 0               ; [patched: BCK] rising edge: data stable
+    in pins, 1                  ; odd bit (autopush at bit 32 = left word)
+    wait 0 gpio 0               ; [patched: BCK]
+    wait 1 gpio 0               ; [patched: BCK]
+    in pins, 1                  ; even bit
+    jmp x-- bitpair
+    wait 0 gpio 0               ; [patched: BCK]
+    wait 1 gpio 0               ; [patched: BCK]
+    in pins, 1                  ; bit 63 (cell R31)
+    jmp pin bit64               ; LRCLK high: correctly framed
+    jmp resync_fill             ; LRCLK low a cell early: slipped
+bit64:
+    wait 0 gpio 0               ; [patched: BCK]
+    wait 1 gpio 0               ; [patched: BCK]
+    in pins, 1                  ; bit 64 (cell R32; autopush = right word)
+    jmp pin resync              ; LRCLK still high a cell late: slipped
+.wrap
+resync_fill:
+    in null, 1                  ; complete + autopush the garbage right word
+                                ; so pushes keep strict L,R alternation
+resync:
+    irq 7                       ; flag the slip to software (no wait)
+    jmp entry_point             ; re-frame on the next LRCLK falling edge
+
+; Total: 24 instructions.
+
+% c-sdk {
+
+// ---------------------------------------------------------------------------
+// audio_i2s_rx_slave_checked_program_init - external-clock RX slave with
+// per-frame LRCLK framing verification.
+//
+//   pio       - PIO block
+//   sm        - state machine index
+//   offset    - from pio_add_program() of the PATCHED program copy
+//   data_pin  - GPIO for serial audio data IN
+//   lrclk_pin - GPIO of the externally driven LRCLK (for the JMP pin checks)
+//
+// Identical to the plain slave init plus the JMP pin routing.  Divider
+// stays 1.0 (wait-driven).  Caller owns input enables on data, BCK and
+// LRCLK pads, clears PIO irq flag 7 before enabling, and starts execution
+// at entry_point.
+// ---------------------------------------------------------------------------
+static inline void audio_i2s_rx_slave_checked_program_init(PIO pio, uint sm, uint offset,
+                                                           uint data_pin, uint lrclk_pin) {
+    pio_sm_config sm_config = audio_i2s_rx_slave_checked_program_get_default_config(offset);
+
+    sm_config_set_in_pins(&sm_config, data_pin);
+    sm_config_set_in_shift(&sm_config, false, true, 32);
+    sm_config_set_fifo_join(&sm_config, PIO_FIFO_JOIN_RX);
+    sm_config_set_jmp_pin(&sm_config, lrclk_pin);
+
+    pio_sm_init(pio, sm, offset, &sm_config);
+
+    pio_sm_set_pindirs_with_mask(pio, sm, 0, 1u << data_pin);
+}
+
+%}

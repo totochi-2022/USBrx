@@ -1,23 +1,25 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
- * SPDIF -> USB UAC1 stereo recording device for the RP2040.
- * Copyright (C) 2026 Weeb Labs
+ * I2S (ADC) -> USB UAC1 stereo recording device for the RP2040 / RP2350.
+ * Copyright (C) 2026 Weeb Labs (S/PDIF original); I2S input variant.
  *
- *   S/PDIF input (GPIO) --[pico_spdif_rx: PIO + DMA]--> internal FIFO (ring buffer)
+ *   I2S ADC data (GPIO) --[PIO slave RX + DMA ring, clocks from DSPi]--> ring
  *                                                          |
  *                              rate-matching servo (per USB frame)
  *                                                          |
  *                         UAC1 isochronous async IN endpoint --> USB host
  *
- * The S/PDIF receiver recovers the sample rate and fills an internal FIFO. The
- * USB host polls the isochronous IN endpoint once per (1 ms) frame. Each frame
- * we decide how many stereo frames to send: a feed-forward term equal to the
- * actual S/PDIF rate (samples per millisecond) plus a small proportional
- * correction that keeps the FIFO near a target fill level. Varying the packet
- * size frame-by-frame is the implicit feedback that matches the USB data rate
- * to the free-running S/PDIF clock (no resampling).
+ * BCK/LRCLK are driven by an external I2S master (normally the DSPi that
+ * plays the same session), so recording and playback share one clock.  The
+ * receiver measures the LRCLK rate and fills a ring.  The USB host polls the
+ * isochronous IN endpoint once per (1 ms) frame.  Each frame we decide how many
+ * stereo frames to send: a feed-forward term equal to the measured I2S rate
+ * (samples per millisecond) plus a small proportional correction that keeps
+ * the ring near a target fill level.  Varying the packet size frame-by-frame
+ * is the implicit feedback that matches the USB data rate to the I2S clock
+ * (no resampling).
  *
- * The sample rate is dictated by the S/PDIF source. The host must select the
+ * The sample rate is dictated by the I2S master. The host must select the
  * matching rate; if it does not, audio streams at the wrong pitch (by design).
  *
  * TinyUSB's built-in audio driver is UAC2-only, so the audio function is
@@ -33,17 +35,19 @@
 #include "device/usbd_pvt.h"      /* usbd_class_driver_t, usbd_edpt_* */
 #include "class/audio/audio.h"    /* AUDIO_* constants (not pulled in when CFG_TUD_AUDIO=0) */
 
-#include "spdif_rx.h"
+#include "i2s_rx.h"
 #include "tusb_config.h"
 
 /* -------------------------------------------------------------------------- */
 /* Configuration                                                               */
 /* -------------------------------------------------------------------------- */
-#define SPDIF_DATA_PIN        15     /* S/PDIF data input GPIO */
-#define SPDIF_LOCK_STATUS_44100_PIN 2      /* S/PDIF lock at 44100 output GPIO */
-#define SPDIF_LOCK_STATUS_48000_PIN 3      /* S/PDIF lock at 44100 output GPIO */
-#define SPDIF_LOCK_STATUS_88200_PIN 4      /* S/PDIF lock at 44100 output GPIO */
-#define SPDIF_LOCK_STATUS_96000_PIN 5      /* S/PDIF lock at 44100 output GPIO */
+#define I2S_DATA_PIN          12     /* I2S data in (ADC DOUT) */
+#define I2S_BCK_PIN           10     /* I2S bit clock in (from the master) */
+#define I2S_LRCLK_PIN         11     /* I2S word clock in (from the master) */
+#define LOCK_STATUS_44100_PIN 2      /* high when locked to 44.1 kHz */
+#define LOCK_STATUS_48000_PIN 3      /* high when locked to 48 kHz */
+#define LOCK_STATUS_88200_PIN 4      /* high when locked to 88.2 kHz */
+#define LOCK_STATUS_96000_PIN 5      /* high when locked to 96 kHz */
 
 #define PIN_DCDC_PSM_CTRL     23     /* Pico SMPS mode pin: drive high for PWM (less audio noise) */
 
@@ -53,13 +57,12 @@
 #define UAC1_REQ_SET_CUR      0x01
 #define UAC1_REQ_GET_CUR      0x81
 
-/* Target number of stereo frames buffered in the S/PDIF FIFO. The receiver's
- * DMA delivers data in blocks of 192 stereo frames, so the working point must
- * comfortably exceed one block. 256 frames keeps latency low (~5.3 ms @ 48 kHz)
- * while leaving ample margin against under/overflow (FIFO holds 1536 frames). */
+/* Target number of stereo frames buffered in the I2S ring. 256 frames keeps
+ * latency low (~5.3 ms @ 48 kHz) while leaving ample margin against
+ * under/overflow (ring holds 2048 frames). */
 #define TARGET_FILL_FRAMES    256
 
-/* Proportional servo gain and clamp. The S/PDIF and USB clocks differ only by a
+/* Proportional servo gain and clamp. The I2S and USB clocks differ only by a
  * few ppm, so only a tiny correction is ever needed in steady state; the clamp
  * also bounds the pull-in rate so the audio is never noticeably time-warped. */
 #define SERVO_KP              0.008f   /* (samples/frame) per (frame) of fill error */
@@ -71,7 +74,7 @@
 static volatile uint32_t g_usb_sample_rate = 48000;   /* host-selected rate (echoed on GET_CUR) */
 static uint32_t          g_silence_frames  = 48;      /* silence packet size = host_rate / 1000  */
 
-static spdif_rx_samp_freq_t g_last_sf      = SAMP_FREQ_NONE;
+static uint32_t             g_last_rate    = 0;       /* last locked I2S rate seen by the servo */
 static float                g_nominal_fpf  = 48.0f;   /* nominal stereo frames per USB frame */
 static float                g_acc          = 0.0f;    /* fractional-sample accumulator */
 
@@ -81,22 +84,14 @@ static bool g_primed    = false;   /* FIFO has reached target at least once */
 /* IN packet scratch (RAM). Only touched while no transfer is in flight. */
 static uint8_t __attribute__((aligned(4))) g_pkt[USBRX_EP_IN_SIZE];
 
-/* Flags set from S/PDIF IRQ callbacks, consumed (for logging) in main loop. */
-static volatile bool g_evt_stable = false;
-static volatile bool g_evt_lost   = false;
-
-/* Current lock state */
-static bool g_locked = false;
-
-
 /* -------------------------------------------------------------------------- */
 /* Rate-matching servo                                                         */
 /* -------------------------------------------------------------------------- */
-static void update_nominal_from_spdif(void)
+static void update_nominal_from_i2s(void)
 {
     /* Use the measured frequency so the feed-forward includes the source's real
-     * ppm offset; the servo then only has to absorb USB-vs-S/PDIF frame jitter. */
-    float actual = spdif_rx_get_samp_freq_actual();
+     * ppm offset; the servo then only has to absorb USB-vs-I2S frame jitter. */
+    float actual = i2s_rx_get_rate_actual();
     if (actual < 1000.0f) {
         actual = (float) g_usb_sample_rate;   /* fallback before a measurement exists */
     }
@@ -115,8 +110,8 @@ static inline uint16_t silence_bytes(void)
  */
 static uint16_t fill_audio_packet(uint8_t *buf)
 {
-    /* No valid S/PDIF signal: emit silence at the host's cadence, stay unprimed. */
-    if (spdif_rx_get_state() != SPDIF_RX_STATE_STABLE) {
+    /* No valid I2S clocks/rate: emit silence at the host's cadence, stay unprimed. */
+    if (!i2s_rx_locked()) {
         g_primed = false;
         g_acc    = 0.0f;
         uint16_t n = silence_bytes();
@@ -124,19 +119,25 @@ static uint16_t fill_audio_packet(uint8_t *buf)
         return n;
     }
 
-    /* Refresh the feed-forward rate if the detected S/PDIF rate changed. */
-    spdif_rx_samp_freq_t sf = spdif_rx_get_samp_freq();
-    if (sf != g_last_sf && sf != SAMP_FREQ_NONE) {
-        g_last_sf = sf;
-        update_nominal_from_spdif();
+    /* Refresh the feed-forward rate if the detected I2S rate changed; while
+     * locked, also track the smoothed measurement. */
+    uint32_t rate = i2s_rx_get_rate();
+    if (rate != g_last_rate) {
+        g_last_rate = rate;
         g_acc = 0.0f;
     }
+    update_nominal_from_i2s();
 
-    uint32_t avail = spdif_rx_get_fifo_count() / 2;   /* stereo frames available */
+    uint32_t avail = i2s_rx_frames_available();   /* stereo frames available */
 
     /* Prime: wait until the FIFO has filled to the target before streaming audio. */
     if (!g_primed) {
         if (avail >= (uint32_t) TARGET_FILL_FRAMES) {
+            /* Start exactly at the target fill: audio that piled up while
+             * acquiring would otherwise take the clamped servo a long, pitch-
+             * shifted time to drain. */
+            i2s_rx_trim(TARGET_FILL_FRAMES);
+            avail    = TARGET_FILL_FRAMES;
             g_primed = true;
             g_acc    = 0.0f;
         } else {
@@ -168,40 +169,9 @@ static uint16_t fill_audio_packet(uint8_t *buf)
         return z;
     }
 
-    /* ---- Copy + convert n stereo frames (2n subframe words) to 24-bit LE ---- */
-    uint32_t words_needed = (uint32_t) n * 2;
-    uint32_t got = 0;
-    uint8_t *dst = buf;
-
-    while (got < words_needed) {
-        uint32_t *src;
-        uint32_t  c = spdif_rx_read_fifo(&src, words_needed - got);
-        if (c == 0) break;
-        for (uint32_t i = 0; i < c; i++) {
-            /* FIFO word: [27:4] = 24-bit signed audio (MSB at bit 27). */
-            uint32_t s = (src[i] >> 4) & 0x00FFFFFFu;
-            *dst++ = (uint8_t)(s & 0xFF);
-            *dst++ = (uint8_t)((s >> 8) & 0xFF);
-            *dst++ = (uint8_t)((s >> 16) & 0xFF);
-        }
-        got += c;
-    }
-
-    return (uint16_t)(got * USBRX_BYTES_PER_SAMPLE);
-}
-
-/* -------------------------------------------------------------------------- */
-/* S/PDIF callbacks (IRQ context: keep short)                                  */
-/* -------------------------------------------------------------------------- */
-static void on_stable_func(spdif_rx_samp_freq_t samp_freq)
-{
-    (void) samp_freq;
-    g_evt_stable = true;
-}
-
-static void on_lost_stable_func(void)
-{
-    g_evt_lost = true;
+    /* ---- Copy + convert n stereo frames to 24-bit LE ---- */
+    uint32_t got = i2s_rx_read_s24le(buf, (uint32_t) n);
+    return (uint16_t)(got * USBRX_BYTES_PER_FRAME);
 }
 
 /* ========================================================================== */
@@ -249,6 +219,7 @@ static bool uac1_apply_alt(uint8_t rhport, uint8_t alt)
         g_streaming  = true;
         g_primed     = false;
         g_acc        = 0.0f;
+        i2s_rx_flush();        /* start capture at "now" */
 
         uac1_arm_in(rhport);   /* queue the first packet */
     } else {
@@ -457,19 +428,19 @@ static inline void led_init(void)
 
 /* -------------------------------------------------------------------------- */
 /* GPIO output status indicators                                              */
-/* one each for locked to 44.1, 48, 88.2 and 96kHz S/PDIF input               */
+/* one each for locked to 44.1, 48, 88.2 and 96kHz I2S input                  */
 /* -------------------------------------------------------------------------- */
 static inline void usbrx_gpio_init(void)
 {
-    gpio_init(SPDIF_LOCK_STATUS_44100_PIN);
-    gpio_init(SPDIF_LOCK_STATUS_48000_PIN);
-    gpio_init(SPDIF_LOCK_STATUS_88200_PIN);
-    gpio_init(SPDIF_LOCK_STATUS_96000_PIN);
+    gpio_init(LOCK_STATUS_44100_PIN);
+    gpio_init(LOCK_STATUS_48000_PIN);
+    gpio_init(LOCK_STATUS_88200_PIN);
+    gpio_init(LOCK_STATUS_96000_PIN);
 
-    gpio_set_dir(SPDIF_LOCK_STATUS_44100_PIN, GPIO_OUT);
-    gpio_set_dir(SPDIF_LOCK_STATUS_48000_PIN, GPIO_OUT);
-    gpio_set_dir(SPDIF_LOCK_STATUS_88200_PIN, GPIO_OUT);
-    gpio_set_dir(SPDIF_LOCK_STATUS_96000_PIN, GPIO_OUT);
+    gpio_set_dir(LOCK_STATUS_44100_PIN, GPIO_OUT);
+    gpio_set_dir(LOCK_STATUS_48000_PIN, GPIO_OUT);
+    gpio_set_dir(LOCK_STATUS_88200_PIN, GPIO_OUT);
+    gpio_set_dir(LOCK_STATUS_96000_PIN, GPIO_OUT);
 }
 
 static inline void led_set(bool on)
@@ -503,20 +474,20 @@ static void led_task(void)
 
 static void gpio_task(void)
 {
-    if(g_locked == true)
+    if (i2s_rx_locked())
     {
-        spdif_rx_samp_freq_t sf = spdif_rx_get_samp_freq();
-        gpio_put(SPDIF_LOCK_STATUS_44100_PIN, sf == SAMP_FREQ_44100 ? 1 : 0);
-        gpio_put(SPDIF_LOCK_STATUS_48000_PIN, sf == SAMP_FREQ_48000 ? 1 : 0);
-        gpio_put(SPDIF_LOCK_STATUS_88200_PIN, sf == SAMP_FREQ_88200 ? 1 : 0);
-        gpio_put(SPDIF_LOCK_STATUS_96000_PIN, sf == SAMP_FREQ_96000 ? 1 : 0);
+        uint32_t r = i2s_rx_get_rate();
+        gpio_put(LOCK_STATUS_44100_PIN, r == 44100 ? 1 : 0);
+        gpio_put(LOCK_STATUS_48000_PIN, r == 48000 ? 1 : 0);
+        gpio_put(LOCK_STATUS_88200_PIN, r == 88200 ? 1 : 0);
+        gpio_put(LOCK_STATUS_96000_PIN, r == 96000 ? 1 : 0);
     }
     else
     {
-        gpio_put(SPDIF_LOCK_STATUS_44100_PIN, 0);
-        gpio_put(SPDIF_LOCK_STATUS_48000_PIN, 0);
-        gpio_put(SPDIF_LOCK_STATUS_88200_PIN, 0);
-        gpio_put(SPDIF_LOCK_STATUS_96000_PIN, 0);
+        gpio_put(LOCK_STATUS_44100_PIN, 0);
+        gpio_put(LOCK_STATUS_48000_PIN, 0);
+        gpio_put(LOCK_STATUS_88200_PIN, 0);
+        gpio_put(LOCK_STATUS_96000_PIN, 0);
     }
 }
 
@@ -525,8 +496,8 @@ static void gpio_task(void)
 /* -------------------------------------------------------------------------- */
 int main(void)
 {
-    /* Keep the default clocks: 125 MHz sys (required by pico_spdif_rx) and the
-     * 48 MHz USB PLL. Do NOT call set_sys_clock_* here. */
+    /* Default clocks are fine: the receiver is wait-driven at divider 1.0
+     * (>= 125 MHz sys gives ~20 PIO cycles per BCK period even at 96 kHz). */
     stdio_init_all();
     led_init();
     usbrx_gpio_init();
@@ -536,40 +507,32 @@ int main(void)
     gpio_set_dir(PIN_DCDC_PSM_CTRL, GPIO_OUT);
     gpio_put(PIN_DCDC_PSM_CTRL, 1);
 
-    printf("\nSPDIF -> USB UAC1 recorder starting (SPDIF on GP%d)\n", SPDIF_DATA_PIN);
+    printf("\nI2S -> USB UAC1 recorder starting\n");
 
     /* Start the USB device stack FIRST so the device always enumerates,
-     * independent of whether an S/PDIF signal is present. */
+     * independent of whether I2S clocks are present. */
     tusb_init();
 
-    /* Start the S/PDIF receiver (non-blocking; just waits for a signal). */
-    spdif_rx_config_t config = {
-        .data_pin     = SPDIF_DATA_PIN,
-        .pio_sm       = 0,
-        .dma_channel0 = 0,
-        .dma_channel1 = 1,
-        .alarm_pool   = alarm_pool_get_default(),
-        .flags        = SPDIF_RX_FLAGS_ALL,
-    };
-    spdif_rx_start(&config);
-    spdif_rx_set_callback_on_stable(on_stable_func);
-    spdif_rx_set_callback_on_lost_stable(on_lost_stable_func);
+    /* Start the I2S slave receiver (waits for the master's clocks). */
+    i2s_rx_init(I2S_DATA_PIN, I2S_BCK_PIN, I2S_LRCLK_PIN);
 
+    i2s_rx_state_t last_state = I2S_RX_NO_CLOCK;
     while (true) {
         tud_task();
+        i2s_rx_poll();
         led_task();
         gpio_task();
 
-        if (g_evt_stable) {
-            g_evt_stable = false;
-            g_locked = true;
-            printf("S/PDIF locked: %d Hz (%.1f Hz actual)\n",
-                   (int) spdif_rx_get_samp_freq(), (double) spdif_rx_get_samp_freq_actual());
-        }
-        if (g_evt_lost) {
-            g_evt_lost = false;
-            g_locked = false;
-            printf("S/PDIF signal lost\n");
+        i2s_rx_state_t st = i2s_rx_get_state();
+        if (st != last_state) {
+            if (st == I2S_RX_LOCKED) {
+                printf("I2S locked: %lu Hz (slips %lu)\n",
+                       (unsigned long) i2s_rx_get_rate(),
+                       (unsigned long) i2s_rx_get_slip_count());
+            } else if (st == I2S_RX_NO_CLOCK) {
+                printf("I2S clocks lost\n");
+            }
+            last_state = st;
         }
     }
     return 0;
